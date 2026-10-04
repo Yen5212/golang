@@ -1,0 +1,144 @@
+項目概述
+本計畫將帶領大家使用Go語言建構一個簡易的、可擴展的網路爬蟲框架。此框架的核心功能是能夠從指定的起始URL開始，抓取網頁內容，並解析出頁面中的標題（Title）和所有超連結（Href）。透過這個項目，你將掌握HTTP請求、HTML解析、同時控制、資料擷取等核心技能，並理解一個基礎爬蟲框架的架構設計。
+學習目標：理解爬蟲工作原理，掌握Go的net/http、goquery庫，實踐並發程式設計與通道通訊。
+核心功能與特性
+•	網頁抓取：使用標準函式庫net/http發送GET請求，以取得HTML回應。
+•	內容解析：利用第三方函式庫goquery（類似jQuery）解析DOM，擷取標題和連結。
+•	並發控制：使用goroutine和channel實現高效的並發抓取，並限制並發數防止被封鎖。
+•	連結去重：使用map或sync.Map確保相同的URL不會被重複抓取。
+•	結果輸出：將抓取到的標題和連結以結構化的方式（如JSON或控制台表格）輸出。
+•	可設定性：允許設定請求頭（如User-Agent）、逾時時間、最大抓取深度等參數。
+
+核心程式碼範例
+1. 定義抓取結果結構體
+// Result 代表从单个页面抓取到的结果
+type Result struct {
+    URL   string `json:"url"`
+    Title string `json:"title"`
+    Links []string `json:"links,omitempty"` // omitempty表示如果为空则不输出
+    Error string `json:"error,omitempty"`
+}
+
+// Crawler 爬虫核心结构
+type Crawler struct {
+    startURL    string
+    maxDepth    int
+    maxWorkers  int
+    visited     *sync.Map // 线程安全的Map用于去重
+    results     chan Result
+}
+2. 網頁下載與解析函數
+import (
+    "net/http"
+    "github.com/PuerkitoBio/goquery"
+)
+
+// fetchAndParse 下载URL并解析标题与链接
+func (c *Crawler) fetchAndParse(url string) (Result, error) {
+    // 1. 发送HTTP请求
+    client := &http.Client{Timeout: 10 * time.Second}
+    req, _ := http.NewRequest("GET", url, nil)
+    req.Header.Set("User-Agent", "Mozilla/5.0 (Go-Crawler)")
+
+    resp, err := client.Do(req)
+    if err != nil {
+        return Result{URL: url, Error: err.Error()}, err
+    }
+    defer resp.Body.Close()
+
+    // 2. 使用goquery解析文档
+    doc, err := goquery.NewDocumentFromReader(resp.Body)
+    if err != nil {
+        return Result{URL: url, Error: err.Error()}, err
+    }
+
+    // 3. 提取标题
+    title := doc.Find("title").Text()
+
+    // 4. 提取所有链接
+    var links []string
+    doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
+        href, exists := s.Attr("href")
+        if exists && href != "" {
+            // 简单处理相对路径，此处可扩展为绝对URL
+            links = append(links, href)
+        }
+    })
+
+    return Result{URL: url, Title: title, Links: links}, nil
+}
+3. 並發調度器核心邏輯
+// Run 启动爬虫
+func (c *Crawler) Run() []Result {
+    var wg sync.WaitGroup
+    urlChan := make(chan string, 100) // URL任务通道
+    var allResults []Result
+
+    // 启动工作池
+    for i := 0; i < c.maxWorkers; i++ {
+        wg.Add(1)
+        go func(workerID int) {
+            defer wg.Done()
+            for url := range urlChan {
+                // 检查是否已访问
+                if _, loaded := c.visited.LoadOrStore(url, true); loaded {
+                    continue
+                }
+                // 抓取并解析
+                result, err := c.fetchAndParse(url)
+                if err == nil && len(result.Links) > 0 && c.maxDepth > 0 {
+                    // 将新发现的链接发送回通道（需控制深度）
+                    for _, link := range result.Links {
+                        select {
+                        case urlChan <- link:
+                        default:
+                            // 通道满，丢弃
+                        }
+                    }
+                }
+                c.results <- result
+            }
+        }(i)
+    }
+
+    // 放入起始URL
+    urlChan <- c.startURL
+
+    // 收集结果
+    go func() {
+        for res := range c.results {
+            allResults = append(allResults, res)
+            fmt.Printf("抓取成功: %s -> %s\n", res.URL, res.Title)
+        }
+    }()
+
+    // 等待所有任务完成并关闭通道
+    close(urlChan)
+    wg.Wait()
+    close(c.results)
+
+    return allResults
+}
+專案實務步驟
+1.	環境準備：安裝Go（1.16+），初始化專案模組go mod init crawler，並取得goquery依賴go get github.com/PuerkitoBio/goquery。
+2.	定義資料結構：創建crawler.go，定義Result和Crawler結構體。
+3.	實作下載解析：寫fetchAndParse函數，完成HTTP請求和DOM解析。
+4.	建構並發引擎：實作Run方法，建構worker池和任務通道。
+5.	新增去重邏輯：使用sync.Map確保URL唯一性。
+6.	編寫主函數：創建main.go，配置爬蟲參數並啟動，將結果輸出為JSON檔案。
+7.	測試與最佳化：使用一個測試網站（如個人部落格）運行爬蟲，觀察輸出，調整並發數和延遲。
+注意事項與擴展思考
+重要提示：請遵守目標網站的robots.txt協議，並設定合理的抓取延遲，避免對對方伺服器造成壓力。
+•	錯誤處理：網路請求可能失敗，需要完善的錯誤處理和重試機制。
+•	深度控制：目前範例的深度控制較簡單，可引入一個記錄目前深度的結構來精確控制。
+•	連結標準化：需要將相對路徑轉換為絕對URL，可以使用net/url套件。
+•	擴展方向：
+o	新增代理支援。
+o	解析更多元素（如圖片、內文）。
+o	將結果儲存到資料庫（如SQLite、MySQL）。
+o	實現分散式爬蟲。
+
+
+
+
+
